@@ -9,17 +9,99 @@ import os
 import numpy as np
 import librosa
 import sounddevice as sd
+import threading
 from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
                             QHBoxLayout, QPushButton, QSlider, QLabel, 
-                            QComboBox, QFrame, QFileDialog)
+                            QComboBox, QFrame, QFileDialog, QProgressDialog)
 from PyQt6.QtGui import QPainter, QColor, QPen, QBrush, QFont, QLinearGradient
-from PyQt6.QtCore import Qt, QTimer, QRect, QPointF, pyqtSignal
+from PyQt6.QtCore import Qt, QTimer, QRect, QPointF, pyqtSignal, QThread
 
 # Add parent directory to path for imports
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 # Import our modules
 from src.pitch_visualizer import PianoKeyboard, PitchDisplay
+
+class FileProcessingThread(QThread):
+    """Thread for processing audio files to avoid UI freezing."""
+    progress_signal = pyqtSignal(int)
+    finished_signal = pyqtSignal(object, object, object, int)
+    
+    def __init__(self, file_path, hop_length=512, fmin=80.0, fmax=1000.0, 
+                 energy_threshold=0.05, silence_threshold=0.1):
+        super().__init__()
+        self.file_path = file_path
+        self.hop_length = hop_length
+        self.fmin = fmin
+        self.fmax = fmax
+        self.energy_threshold = energy_threshold
+        self.silence_threshold = silence_threshold
+    
+    def run(self):
+        try:
+            # Load audio file
+            audio_data, sample_rate = librosa.load(self.file_path, sr=None)
+            
+            # Calculate energy for voice activity detection
+            energy = librosa.feature.rms(y=audio_data, frame_length=self.hop_length*2, 
+                                        hop_length=self.hop_length)[0]
+            
+            # Normalize energy
+            energy = energy / np.max(energy) if np.max(energy) > 0 else energy
+            
+            # Extract pitch using librosa
+            pitches, magnitudes = librosa.piptrack(
+                y=audio_data, 
+                sr=sample_rate,
+                hop_length=self.hop_length,
+                fmin=self.fmin,
+                fmax=self.fmax
+            )
+            
+            # Extract the most prominent pitch for each frame
+            pitch_data = []
+            confidence_data = []
+            
+            total_frames = pitches.shape[1]
+            
+            for t in range(total_frames):
+                # Update progress (emit every 10 frames to avoid UI overload)
+                if t % 10 == 0:
+                    self.progress_signal.emit(int(100 * t / total_frames))
+                
+                # Check if this frame has enough energy (voice activity detection)
+                is_voice = energy[t] > self.energy_threshold
+                
+                index = magnitudes[:, t].argmax()
+                pitch = pitches[index, t]
+                confidence = magnitudes[index, t]
+                
+                # Only include pitches with sufficient magnitude and energy
+                if confidence > 0 and is_voice:
+                    pitch_data.append(float(pitch))
+                else:
+                    pitch_data.append(0.0)
+                
+                # Normalize confidence and apply voice activity detection
+                max_possible = np.abs(audio_data).max()
+                if max_possible > 0:
+                    # Scale confidence by energy to reduce non-vocal sounds
+                    if is_voice:
+                        conf_value = min(float(confidence / max_possible), 1.0)
+                        # Further boost confidence for strong signals
+                        conf_value = conf_value * (1.0 + energy[t])
+                        confidence_data.append(min(conf_value, 1.0))
+                    else:
+                        confidence_data.append(0.0)
+                else:
+                    confidence_data.append(0.0)
+            
+            # Emit finished signal with results
+            self.finished_signal.emit(audio_data, pitch_data, confidence_data, sample_rate)
+            
+        except Exception as e:
+            print(f"Error processing file: {e}")
+            self.finished_signal.emit(None, None, None, 0)
 
 class FileVisualizer(QMainWindow):
     """Main window for the file-based pitch visualizer application."""
@@ -58,8 +140,14 @@ class FileVisualizer(QMainWindow):
         self.open_button.clicked.connect(self.open_file)
         controls_layout.addWidget(self.open_button)
         
+        # Rewind button
+        self.rewind_button = QPushButton("⏮ Rewind")
+        self.rewind_button.clicked.connect(self.rewind)
+        self.rewind_button.setEnabled(False)
+        controls_layout.addWidget(self.rewind_button)
+        
         # Play/Pause button
-        self.play_button = QPushButton("Play")
+        self.play_button = QPushButton("▶ Play")
         self.play_button.clicked.connect(self.toggle_playback)
         self.play_button.setEnabled(False)
         controls_layout.addWidget(self.play_button)
@@ -105,6 +193,10 @@ class FileVisualizer(QMainWindow):
         self.audio_buffer_size = 1024
         self.audio_position = 0
         
+        # File processing
+        self.processing_thread = None
+        self.progress_dialog = None
+        
         # Apply macOS style
         self.apply_mac_style()
     
@@ -135,6 +227,10 @@ class FileVisualizer(QMainWindow):
             QPushButton:pressed {
                 background-color: #0068d1;
             }
+            QPushButton:disabled {
+                background-color: #cccccc;
+                color: #999999;
+            }
             QSlider::groove:horizontal {
                 border: 1px solid #bdbdbd;
                 height: 4px;
@@ -159,6 +255,26 @@ class FileVisualizer(QMainWindow):
             QLabel {
                 color: #333333;
             }
+            QProgressDialog {
+                background-color: #f5f5f7;
+                border: 1px solid #cccccc;
+                border-radius: 6px;
+            }
+            QProgressDialog QLabel {
+                font-size: 14px;
+                color: #333333;
+            }
+            QProgressDialog QProgressBar {
+                border: 1px solid #bdbdbd;
+                border-radius: 4px;
+                background-color: #e0e0e0;
+                text-align: center;
+                color: #333333;
+            }
+            QProgressDialog QProgressBar::chunk {
+                background-color: #0071e3;
+                border-radius: 3px;
+            }
         """)
     
     def open_file(self):
@@ -170,75 +286,93 @@ class FileVisualizer(QMainWindow):
         if not file_path:
             return
         
-        try:
-            # Load audio file
-            self.audio_data, self.sample_rate = librosa.load(file_path, sr=None)
-            
-            # Process pitch
-            self.process_pitch()
+        # Disable buttons during processing
+        self.open_button.setEnabled(False)
+        self.play_button.setEnabled(False)
+        self.rewind_button.setEnabled(False)
+        
+        # Create progress dialog
+        self.progress_dialog = QProgressDialog("Processing audio file...", "Cancel", 0, 100, self)
+        self.progress_dialog.setWindowTitle("Loading File")
+        self.progress_dialog.setWindowModality(Qt.WindowModality.WindowModal)
+        self.progress_dialog.setMinimumDuration(0)  # Show immediately
+        self.progress_dialog.setValue(0)
+        
+        # Create and start processing thread
+        self.processing_thread = FileProcessingThread(file_path)
+        self.processing_thread.progress_signal.connect(self.update_progress)
+        self.processing_thread.finished_signal.connect(self.processing_finished)
+        self.processing_thread.start()
+    
+    def update_progress(self, value):
+        """Update progress dialog."""
+        if self.progress_dialog:
+            self.progress_dialog.setValue(value)
+    
+    def processing_finished(self, audio_data, pitch_data, confidence_data, sample_rate):
+        """Handle completion of file processing."""
+        # Close progress dialog
+        if self.progress_dialog:
+            self.progress_dialog.close()
+            self.progress_dialog = None
+        
+        # Re-enable buttons
+        self.open_button.setEnabled(True)
+        
+        if audio_data is not None:
+            # Store processed data
+            self.audio_data = audio_data
+            self.pitch_data = pitch_data
+            self.confidence_data = confidence_data
+            self.sample_rate = sample_rate
             
             # Update UI
-            filename = os.path.basename(file_path)
+            filename = os.path.basename(self.processing_thread.file_path)
             self.file_label.setText(f"File: {filename}")
             self.play_button.setEnabled(True)
+            self.rewind_button.setEnabled(True)
             self.current_frame = 0
             
             # Reset display
             self.piano.set_current_note(0)
             for _ in range(self.pitch_display.history_size):
                 self.pitch_display.add_pitch(0, 0)
-            
-        except Exception as e:
-            print(f"Error loading file: {e}")
-            self.file_label.setText(f"Error: {str(e)}")
+        else:
+            # Show error
+            self.file_label.setText("Error loading file")
+        
+        # Clean up thread
+        self.processing_thread = None
     
-    def process_pitch(self):
-        """Process pitch data from audio file."""
-        if self.audio_data is None:
-            return
+    def rewind(self):
+        """Rewind to the beginning of the file."""
+        # Stop playback if playing
+        if self.is_playing:
+            self.stop_audio()
+            self.timer.stop()
+            self.play_button.setText("▶ Play")
+            self.is_playing = False
         
-        # Extract pitch using librosa
-        pitches, magnitudes = librosa.piptrack(
-            y=self.audio_data, 
-            sr=self.sample_rate,
-            hop_length=self.hop_length,
-            fmin=80.0,
-            fmax=1000.0
-        )
+        # Reset position
+        self.current_frame = 0
+        self.audio_position = 0
         
-        # Extract the most prominent pitch for each frame
-        self.pitch_data = []
-        self.confidence_data = []
-        
-        for t in range(pitches.shape[1]):
-            index = magnitudes[:, t].argmax()
-            pitch = pitches[index, t]
-            confidence = magnitudes[index, t]
-            
-            # Only include pitches with sufficient magnitude
-            if confidence > 0:
-                self.pitch_data.append(float(pitch))
-            else:
-                self.pitch_data.append(0.0)
-            
-            # Normalize confidence
-            max_possible = np.abs(self.audio_data).max()
-            if max_possible > 0:
-                self.confidence_data.append(min(float(confidence / max_possible), 1.0))
-            else:
-                self.confidence_data.append(0.0)
+        # Reset display
+        self.piano.set_current_note(0)
+        for _ in range(self.pitch_display.history_size):
+            self.pitch_display.add_pitch(0, 0)
     
     def toggle_playback(self):
         """Toggle between playing and paused states."""
         if self.is_playing:
             self.stop_audio()
             self.timer.stop()
-            self.play_button.setText("Play")
+            self.play_button.setText("▶ Play")
             self.is_playing = False
         else:
             self.start_audio()
             self.timer.start(30)  # 30ms = ~33fps
-            self.play_button.setText("Pause")
+            self.play_button.setText("⏸ Pause")
             self.is_playing = True
     
     def start_audio(self):
@@ -323,6 +457,12 @@ class FileVisualizer(QMainWindow):
         """Handle window close event."""
         if self.is_playing:
             self.stop_audio()
+        
+        # Cancel processing if in progress
+        if self.processing_thread and self.processing_thread.isRunning():
+            self.processing_thread.terminate()
+            self.processing_thread.wait()
+        
         event.accept()
 
 def main():
