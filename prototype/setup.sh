@@ -28,22 +28,9 @@ MISSING_PACKAGES=0
 check_package numpy
 check_package matplotlib
 check_package scipy
-check_package pandas
-
-# Check if aubio is installed
-python3 -c "import aubio" 2>/dev/null
-if [ $? -ne 0 ]; then
-  echo "Package aubio is not installed. Please install it using: pip install aubio"
-  echo "Note: If installation fails, you may need to install portaudio first:"
-  echo "  macOS: brew install portaudio"
-  echo "  Linux: sudo apt-get install libportaudio2 portaudio19-dev"
-  MISSING_PACKAGES=1
-else
-  echo "✓ aubio"
-fi
-
-# Check if librosa is installed
 check_package librosa
+check_package sounddevice
+check_package PyQt6
 
 if [ $MISSING_PACKAGES -eq 0 ]; then
   echo "All required packages are installed."
@@ -54,6 +41,9 @@ if [ $MISSING_PACKAGES -eq 0 ]; then
   echo ""
   echo "Then detect pitch in the generated tones:"
   echo "  ./src/detect_pitch.py reference_tones/tone_440Hz.wav --method yin --plot"
+  echo ""
+  echo "Or run the main application:"
+  echo "  python ../pitch_track.py"
   echo ""
 else
   echo "Please install the missing packages and run this script again."
