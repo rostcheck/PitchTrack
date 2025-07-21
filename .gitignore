@@ -5,3 +5,8 @@ bungee/
 __pycache__
 reference_music/
 transcript.txt
+*.fls
+*.out
+*.aux
+*.fdb_latexmk
+*.log
