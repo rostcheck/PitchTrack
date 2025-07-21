@@ -4,9 +4,13 @@ bungee/
 *~
 __pycache__
 reference_music/
-transcript.txt
+transcript*.txt
 *.fls
 *.out
 *.aux
 *.fdb_latexmk
 *.log
+venv*
+.venv
+*.mp3
+*.wav

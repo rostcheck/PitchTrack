@@ -1,0 +1,28 @@
+# Virtual environments
+venv*/
+
+# Cached Python files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# macOS system files
+.DS_Store
+
+# Large model files
+pretrained_models/*.tar.gz
+pretrained_models/*/
+
+# Test results (optionally keep a small subset)
+# test_results/
+
+# Distribution / packaging
+*.egg-info/
+dist/
+build/
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Demucs cache
+.cache/torch/
